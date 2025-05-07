@@ -1,0 +1,74 @@
+WITH risk_scoring AS (
+    SELECT 
+        customerID,
+        gender,
+        seniorCitizen,
+        partner,
+        dependents,
+        tenure,
+        contract,
+        paperlessBilling,
+        monthlyCharges,
+        totalCharges,
+        churn,
+        -- 流失倾向得分计算（权重可根据业务调整）
+        -- 基础分：合同类型（月合同风险最高）
+        CASE contract
+            WHEN 'Month-to-month' THEN 0.4
+            WHEN 'One year' THEN 0.2
+            WHEN 'Two year' THEN 0.1
+            ELSE 0.3
+        END +
+        -- 每月费用（标准化到0-0.2范围）
+        (monthlyCharges - (SELECT MIN(monthlyCharges) FROM spark_project.silver)) / 
+        ((SELECT MAX(monthlyCharges) FROM spark_project.silver) - (SELECT MIN(monthlyCharges) FROM spark_project.silver)) * 0.2 +
+        -- 老年人且无伴侣（高风险组合）
+        CASE WHEN seniorCitizen = 1 AND partner = 'No' THEN 0.15 ELSE 0 END +
+        -- 无家属（风险略高）
+        CASE WHEN dependents = 'No' THEN 0.05 ELSE 0 END +
+        -- 使用电子账单（可能反映数字化偏好）
+        CASE WHEN paperlessBilling = 'Yes' THEN 0.1 ELSE 0 END +
+        -- 低tenure（新客户风险高）
+        CASE WHEN tenure < 12 THEN 0.1 ELSE 0 END AS risk_score
+    FROM spark_project.silver
+    WHERE churn = 0  -- 只分析当前未流失的客户
+),
+
+risk_with_rank AS (
+    SELECT 
+        *,
+        PERCENT_RANK() OVER(ORDER BY risk_score DESC) AS percentile_rank
+    FROM risk_scoring
+),
+
+top_risk_customers AS (
+    SELECT *
+    FROM risk_with_rank
+    WHERE percentile_rank <= 0.1  -- 取风险最高的前10%
+)
+
+-- 最终分析报表：按关键维度细分高风险客户
+SELECT 
+    CASE WHEN paperlessBilling = 'Yes' THEN '电子账单用户' ELSE '纸质账单用户' END AS billing_type,
+    CASE 
+        WHEN contract = 'Month-to-month' THEN '月合同'
+        WHEN contract = 'One year' THEN '年合同'
+        WHEN contract = 'Two year' THEN '两年合同'
+        ELSE '其他'
+    END AS contract_type,
+    COUNT(*) AS customer_count,
+    ROUND(AVG(monthlyCharges), 2) AS avg_monthly_charge,
+    ROUND(AVG(totalCharges), 2) AS avg_total_charge,
+    ROUND(AVG(risk_score), 3) AS avg_risk_score,
+    ROUND(SUM(CASE WHEN seniorCitizen = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) AS pct_senior,
+    ROUND(SUM(CASE WHEN partner = 'Yes' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) AS pct_with_partner
+FROM top_risk_customers
+GROUP BY 
+    CASE WHEN paperlessBilling = 'Yes' THEN '电子账单用户' ELSE '纸质账单用户' END,
+    CASE 
+        WHEN contract = 'Month-to-month' THEN '月合同'
+        WHEN contract = 'One year' THEN '年合同'
+        WHEN contract = 'Two year' THEN '两年合同'
+        ELSE '其他'
+    END
+ORDER BY avg_risk_score DESC, customer_count DESC;
